@@ -1,416 +1,668 @@
-%% GMSK调制解调系统仿真 - 修复解调误码问题
-clear all; close all; clc;
+%% GMSK调制解调系统完整仿真
+clear; clc; close all;
 
 %% 参数设置
-N_bits = 100;           % 比特数
-bit_rate = 1000;        % 比特率 (bps)
-Tb = 1/bit_rate;        % 比特周期
-Fs = 16 * bit_rate;     % 采样频率
-Ts = 1/Fs;              % 采样间隔
-sps = Fs/bit_rate;      % 每符号采样点数
-
-% GMSK参数
-BT = 0.3;               % 带宽时间积
-Fc = 4 * bit_rate;      % 载波频率
-
-% 图形显示设置
-show_separate = 1;      % 1=每个图形单独窗口，0=所有图形在一个窗口
-
-fprintf('GMSK系统参数:\n');
-fprintf('比特数: %d\n', N_bits);
-fprintf('比特率: %d bps\n', bit_rate);
-fprintf('采样率: %d Hz\n', Fs);
-fprintf('载波频率: %d Hz\n', Fc);
-fprintf('BT乘积: %.1f\n', BT);
+N_bits = 20;                    % 比特数
+Tb = 1;                         % 码元周期
+dt = 0.01;                      % 采样间隔
+t = 0:dt:N_bits*Tb-dt;          % 时间轴
+E = 1;                          % 信号能量
+fc = 5;                         % 载波频率 (Hz)
 
 %% 生成随机比特序列
-rng(42); % 设置随机种子以便复现
-data_bits = randi([0, 1], 1, N_bits);
+original_bits = [1, -1, -1, -1, 1, 1, 1, -1, 1, -1, -1, 1, 1, -1, 1, -1, 1, 1, -1, -1];
+% original_bits = 2*randi([0 1], 1, N_bits) - 1; % 随机生成±1序列
 
-fprintf('\n比特序列 (前20个): ');
-fprintf('%d ', data_bits(1:min(20, N_bits)));
-fprintf('\n');
+fprintf('原始比特序列: ');
+disp(original_bits);
 
-%% GMSK编码过程
-%% 1. 比特到符号映射（NRZ编码）
-data_nrz = 2 * data_bits - 1; % 0->-1, 1->+1
+%% GMSK调制过程
+fprintf('\n=== GMSK调制过程 ===\n');
 
-% 上采样
-tx_signal = repelem(data_nrz, sps);
+% 高斯脉冲成形函数
+gt = @(t) (erfc(2*pi*0.3*(t - 2) / sqrt(2*log(2))) - erfc(2*pi*0.3*(t + 1) / sqrt(2*log(2)))) / 2;
 
-%% 2. 高斯滤波器设计
-alpha = sqrt(2*log(2)) / (BT * Tb);
-t_gauss = (-3*Tb:Ts:3*Tb);
-gauss_filter = (sqrt(pi)/alpha) * exp(-(pi*t_gauss/alpha).^2);
-gauss_filter = gauss_filter / sum(gauss_filter);
+% 初始化相位和信号
+theta = [0, 1, 1];  % 初始相位状态
+modulated_I = [];   % 同相分量
+modulated_Q = [];   % 正交分量
+phase_history = []; % 相位历史
+time_history = [];  % 时间历史
+gmsk_signal = [];   % GMSK调制信号
+gmsk_transmit = []; % 发送端GMSK信号（带载波）
 
-% 高斯滤波
-filtered_signal = conv(tx_signal, gauss_filter, 'same');
+% 调制每个比特 - 高采样率用于显示连续波形
+for n = 1:N_bits
+    % 计算当前比特的相位贡献
+    current_bit = original_bits(n);
+    
+    % 更新相位状态
+    next_theta = [theta(1) + theta(2) * pi/2, theta(3), current_bit];
+    
+    % 生成高采样率的调制信号用于显示连续波形
+    [Sn_high, Cn_high, phase_high, t_high, gmsk_high, gmsk_transmit_high] = ...
+        gmsk_modulate_high_res([next_theta, theta], n-1, gt, Tb, dt, E, fc);
+    
+    % 生成用于解调的4点采样信号
+    [Sn, Cn, phase] = gmsk_modulate([next_theta, theta], n-1, gt);
+    
+    % 添加噪声到解调信号
+    Sn_noisy = Sn + 0.5*randn(1,4);
+    Cn_noisy = Cn + 0.5*randn(1,4);
+    
+    % 存储信号
+    modulated_I = [modulated_I, Sn_noisy];
+    modulated_Q = [modulated_Q, Cn_noisy];
+    phase_history = [phase_history, phase_high];
+    time_history = [time_history, t_high + (n-1)*Tb];
+    gmsk_signal = [gmsk_signal, gmsk_high];
+    gmsk_transmit = [gmsk_transmit, gmsk_transmit_high];
+    
+    % 更新相位状态
+    theta = next_theta;
+end
 
-%% 3. 相位积分得到相位轨迹
-phase = pi * cumsum(filtered_signal) * Ts / Tb;
+%% 绘制发送端GMSK调制波形 - 专门窗口
+figure('Position', [50, 50, 1400, 1000]);
+sgtitle('发送端GMSK调制信号波形', 'FontSize', 16, 'FontWeight', 'bold');
 
-%% 4. GMSK调制
-t = (0:length(phase)-1) * Ts;
-gmsk_signal = cos(2*pi*Fc*t + phase);
+% 1. 原始比特序列
+subplot(3,3,1);
+bit_time = 0:N_bits-1;
+stem(bit_time, original_bits, 'filled', 'b', 'LineWidth', 2);
+title('原始比特序列');
+xlabel('比特索引');
+ylabel('比特值');
+grid on;
+ylim([-1.5, 1.5]);
 
-%% 5. 添加噪声（AWGN信道）
-SNR_dB = 20; % 提高信噪比以减少误码
-gmsk_signal_noisy = awgn(gmsk_signal, SNR_dB, 'measured');
+% 2. 连续相位轨迹
+subplot(3,3,2);
+plot(time_history, phase_history, 'g-', 'LineWidth', 2);
+hold on;
+% 标记每个比特开始的位置
+for n = 1:N_bits
+    plot([(n-1)*Tb, (n-1)*Tb], [min(phase_history)-0.5, max(phase_history)+0.5], 'r--', 'LineWidth', 0.5);
+end
+title('GMSK连续相位轨迹');
+xlabel('时间 (s)');
+ylabel('相位 (弧度)');
+grid on;
+xlim([0, N_bits*Tb]);
 
-%% 6. 改进的GMSK解调算法
-fprintf('\n开始解调...\n');
+% 3. GMSK基带信号 - 实部
+subplot(3,3,3);
+plot(time_history, real(gmsk_signal), 'm-', 'LineWidth', 1.5);
+title('GMSK基带信号 - 实部');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
 
-% 方法1：改进的正交解调
-I_carrier = cos(2*pi*Fc*t);
-Q_carrier = sin(2*pi*Fc*t);
+% 4. GMSK基带信号 - 虚部
+subplot(3,3,4);
+plot(time_history, imag(gmsk_signal), 'c-', 'LineWidth', 1.5);
+title('GMSK基带信号 - 虚部');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
 
-% 正交下变频
-I_component = gmsk_signal_noisy .* I_carrier;
-Q_component = gmsk_signal_noisy .* Q_carrier;
+% 5. 发送端GMSK信号 - 完整波形
+subplot(3,3,5);
+plot(time_history, gmsk_transmit, 'b-', 'LineWidth', 1.5);
+title('发送端GMSK调制信号 (带载波)');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
 
-% 改进的低通滤波器设计
-lp_cutoff = bit_rate * 1.5; % 截止频率略高于比特率
-[num, den] = butter(8, lp_cutoff/(Fs/2), 'low');
+% 6. 发送端GMSK信号 - 前3个码元细节
+subplot(3,3,6);
+end_idx = min(length(time_history), round(3*Tb/dt));
+plot(time_history(1:end_idx), gmsk_transmit(1:end_idx), 'b-', 'LineWidth', 1.5);
+hold on;
+% 叠加载波参考
+carrier_ref = cos(2*pi*fc*time_history(1:end_idx));
+plot(time_history(1:end_idx), 0.5*carrier_ref, 'r--', 'LineWidth', 1);
+title('前3个码元GMSK信号细节');
+xlabel('时间 (s)');
+ylabel('幅度');
+legend('GMSK信号', '载波参考', 'Location', 'best');
+grid on;
 
-% 滤波
-I_filtered = filtfilt(num, den, I_component); % 使用零相位滤波
-Q_filtered = filtfilt(num, den, Q_component);
+% 7. GMSK信号包络
+subplot(3,3,7);
+envelope = abs(gmsk_signal);
+plot(time_history, envelope, 'k-', 'LineWidth', 2);
+title('GMSK信号包络 (恒定包络特性)');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
+ylim([0, 2]);
 
-% 相位解调 - 修复相位展开问题
-phase_est = atan2(Q_filtered, I_filtered);
+% 8. 瞬时频率变化
+subplot(3,3,8);
+% 计算瞬时频率 (相位差分)
+instant_phase = unwrap(phase_history);
+instant_freq = diff(instant_phase) / (2*pi*dt);
+plot(time_history(1:end-1), instant_freq, 'r-', 'LineWidth', 1.5);
+hold on;
+% 标记理论频偏
+plot([0, N_bits*Tb], [fc, fc], 'k--', 'LineWidth', 1);
+plot([0, N_bits*Tb], [fc+0.25/Tb, fc+0.25/Tb], 'g--', 'LineWidth', 1);
+plot([0, N_bits*Tb], [fc-0.25/Tb, fc-0.25/Tb], 'g--', 'LineWidth', 1);
+title('GMSK瞬时频率');
+xlabel('时间 (s)');
+ylabel('频率 (Hz)');
+legend('瞬时频率', '载波频率', '最大频偏', 'Location', 'best');
+grid on;
+xlim([0, N_bits*Tb]);
 
-% 使用改进的相位解调方法
-phase_unwrapped = unwrap(phase_est);
+% 9. 频谱分析
+subplot(3,3,9);
+[Pxx, F] = pwelch(gmsk_transmit, [], [], [], 1/dt);
+semilogy(F, Pxx, 'b-', 'LineWidth', 1.5);
+hold on;
+% 标记载波频率
+plot([fc, fc], [min(Pxx), max(Pxx)], 'r--', 'LineWidth', 1);
+title('GMSK信号功率谱密度');
+xlabel('频率 (Hz)');
+ylabel('功率谱密度');
+legend('GMSK频谱', '载波频率', 'Location', 'best');
+grid on;
+xlim([0, 2*fc]);
 
-% 计算瞬时频率
-instant_freq = diff(phase_unwrapped) / (2*pi*Ts);
+%% 绘制调制过程波形 - 单独窗口
+figure('Position', [200, 200, 1400, 1000]);
+sgtitle('GMSK调制过程详细显示', 'FontSize', 16, 'FontWeight', 'bold');
 
-% 符号判决 - 改进的判决方法
-demod_bits = zeros(1, N_bits);
+% 1. 原始比特序列
+subplot(3,2,1);
+stem(0:N_bits-1, original_bits, 'filled', 'LineWidth', 2);
+title('原始比特序列');
+xlabel('比特索引');
+ylabel('比特值');
+grid on;
+ylim([-1.5, 1.5]);
 
-% 在每个符号周期中间采样
+% 2. 连续相位轨迹
+subplot(3,2,2);
+plot(time_history, phase_history, 'g-', 'LineWidth', 2);
+hold on;
+% 标记每个比特开始的位置
+for n = 1:N_bits
+    plot([(n-1)*Tb, (n-1)*Tb], [min(phase_history)-0.5, max(phase_history)+0.5], 'r--', 'LineWidth', 0.5);
+end
+title('GMSK连续相位轨迹');
+xlabel('时间 (s)');
+ylabel('相位 (弧度)');
+grid on;
+xlim([0, N_bits*Tb]);
+
+% 3. 同相分量 (I)
+subplot(3,2,3);
+plot(time_history, sqrt(2*E/Tb)*cos(phase_history), 'b-', 'LineWidth', 1.5);
+title('GMSK同相分量 I(t)');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
+
+% 4. 正交分量 (Q)
+subplot(3,2,4);
+plot(time_history, sqrt(2*E/Tb)*sin(phase_history), 'r-', 'LineWidth', 1.5);
+title('GMSK正交分量 Q(t)');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
+
+% 5. 发送端GMSK信号
+subplot(3,2,5);
+plot(time_history, gmsk_transmit, 'b-', 'LineWidth', 1.5);
+title('发送端GMSK调制信号');
+xlabel('时间 (s)');
+ylabel('幅度');
+grid on;
+xlim([0, N_bits*Tb]);
+
+% 6. 星座图
+subplot(3,2,6);
+I_continuous = sqrt(2*E/Tb)*cos(phase_history);
+Q_continuous = sqrt(2*E/Tb)*sin(phase_history);
+scatter(I_continuous(1:10:end), Q_continuous(1:10:end), 10, 'filled', 'b');
+hold on;
+% 标记起点和终点
+plot(I_continuous(1), Q_continuous(1), 'ro', 'MarkerSize', 8, 'LineWidth', 2);
+plot(I_continuous(end), Q_continuous(end), 'rx', 'MarkerSize', 8, 'LineWidth', 2);
+title('GMSK连续星座图');
+xlabel('同相分量 I');
+ylabel('正交分量 Q');
+grid on;
+axis equal;
+
+%% GMSK解调过程
+fprintf('\n=== GMSK解调过程 ===\n');
+
+% 状态转移表
+TransferTable = [
+    0 +1 +1 pi/2 +1 -1 pi -1 +1 pi/2 +1 +1 
+    0 +1 +1 pi/2 +1 -1 pi -1 +1 pi/2 +1 -1  
+    0 +1 +1 pi/2 +1 -1 pi -1 -1 pi/2 -1 +1 
+    0 +1 +1 pi/2 +1 -1 pi -1 -1 pi/2 -1 -1  
+    0 +1 +1 pi/2 +1 +1 pi +1 +1 -pi/2 +1 +1
+    0 +1 +1 pi/2 +1 +1 pi +1 +1 -pi/2 +1 -1
+    0 +1 +1 pi/2 +1 +1 pi +1 -1 -pi/2 -1 +1   
+    0 +1 +1 pi/2 +1 +1 pi +1 -1 -pi/2 -1 -1 
+];
+
+% 解调路径表
+TransferPath = [
+   0        -1      +1     pi/2   -1      -1      -pi/2   +1      -1
+   0        +1      +1      -pi/2    +1      +1      pi/2    -1     +1
+   0        +1      -1      -pi/2    +1      +1      pi/2    -1      +1
+   0        -1      -1     pi/2   -1      -1      -pi/2   +1      -1
+   pi       -1      +1      pi/2    +1      -1      -pi/2    -1      -1
+   pi       +1      +1      pi/2   +1      +1      -pi/2   -1     +1
+   pi       +1      -1      pi/2   +1      +1      -pi/2   -1      +1
+   pi       -1      -1      pi/2    +1      -1      -pi/2    -1      -1
+   pi/2     -1      +1       pi       -1      -1      0       +1      -1
+   pi/2     +1      +1      pi  -1      +1      0      +1      +1
+   pi/2     +1      -1       0      +1      +1      pi      -1      +1
+   pi/2     -1      -1       pi      -1      -1      0       +1      -1
+   -pi/2    -1      +1      pi      +1      -1      0      -1      -1
+   -pi/2    +1      +1      0       -1      +1      pi       +1     +1
+   -pi/2    +1      -1      0       -1      +1      pi       +1      +1
+   -pi/2    -1      -1      0     -1      -1      pi      +1      -1
+];
+
+% 维特比解码初始化
+theta_now = [0, 1, 1];
+hamming_head = zeros(8,3);
+path = [];
+hamming = [];
+method = 'a';
+
+% 解调每个比特
 for i = 1:N_bits
-    % 在符号中间位置采样
-    sample_index = round((i-0.5) * sps);
-    if sample_index > length(instant_freq)
-        sample_index = length(instant_freq);
+    % 提取当前比特的接收信号
+    start_idx = (i-1)*4 + 1;
+    end_idx = i*4;
+    Sn_current = modulated_I(start_idx:end_idx);
+    Cn_current = modulated_Q(start_idx:end_idx);
+    
+    % 维特比解码
+    [path_temp, hamming_temp1, hamming_temp2] = viterbi_decode(Sn_current, Cn_current, i-1, method, TransferTable, TransferPath, gt);
+    
+    % 路径度量处理
+    if i == 4
+        % 调整前3码元的路径度量
+        hamming_head(5:8,1) = hamming_head(2,1);
+        hamming_head(1:4,1) = hamming_head(1,1);
+        hamming_head(7:8,2) = hamming_head(4,2);
+        hamming_head(5:6,2) = hamming_head(3,2);
+        hamming_head(3:4,2) = hamming_head(2,2);
+        hamming_head(1:2,2) = hamming_head(1,2);
+        
+        hamming = zeros(8,1);
+        for k = 1:8
+            hamming(k,1) = sum(hamming_head(k,:));
+        end
     end
     
-    % 根据瞬时频率符号判决
-    if instant_freq(sample_index) > 0
-        demod_bits(i) = 1;
-    else
-        demod_bits(i) = 0;
+    if i-1 > 3
+        if isempty(hamming)
+            hamming = hamming_temp1;
+        else
+            hamming = [hamming, hamming_temp1];
+        end
+    end
+    
+    hamming_head = hamming_head + hamming_temp2;
+    
+    % 修复路径存储问题
+    if ~isempty(path_temp)
+        if isempty(path)
+            path = path_temp;
+        else
+            path = [path, path_temp];
+        end
+    end
+    
+    % 切换方法
+    if i-1 > 3
+        if method == 'a'
+            method = 'b';
+        else
+            method = 'a';
+        end
     end
 end
 
-% 方法2：备用的差分检测方法（如果方法1效果不好）
-if sum(data_bits ~= demod_bits) > N_bits/2
-    fprintf('方法1误码率高，尝试差分检测方法...\n');
+%% 修复路径回溯部分
+fprintf('\n=== 最终解码 ===\n');
+
+% 检查路径矩阵维度
+if isempty(path)
+    error('路径矩阵为空，无法进行解码');
+end
+
+% 路径回溯 - 修复维度问题
+num_segments = size(path, 2) / 6;
+if num_segments ~= round(num_segments)
+    error('路径矩阵列数不是6的倍数');
+end
+
+realpath = [];
+new_hamming = [];
+
+for i = 1:8
+    tempth = path(i, 1:6);
+    temp = path(i, 4:6);
     
-    % 差分检测
-    delayed_signal = [gmsk_signal_noisy(sps+1:end), zeros(1, sps)];
-    product_signal = gmsk_signal_noisy .* delayed_signal;
+    if size(hamming, 2) >= 2
+        new_hamming_temp = hamming(i, 2);
+    else
+        new_hamming_temp = 0;
+    end
     
-    % 低通滤波
-    product_filtered = filtfilt(num, den, product_signal);
-    
-    % 符号判决
-    for i = 1:N_bits
-        sample_index = round((i-0.5) * sps);
-        if sample_index > length(product_filtered)
-            sample_index = length(product_filtered);
+    for k = 1:num_segments - 1
+        start_col = 1 + k*6;
+        end_col = 6 + k*6;
+        
+        if end_col > size(path, 2)
+            break;
         end
         
-        if product_filtered(sample_index) > 0
-            demod_bits(i) = 1;
-        else
-            demod_bits(i) = 0;
+        std_segment = path(:, start_col:end_col);
+        found = false;
+        
+        for index = 1:8
+            if index <= size(std_segment, 1) && all(temp == std_segment(index, 1:3))
+                tempth = [tempth, std_segment(index, 4:6)]; %#ok<AGROW>
+                if size(hamming, 2) >= k + 2
+                    new_hamming_temp = [new_hamming_temp, hamming(index, k + 2)]; %#ok<AGROW>
+                end
+                temp = std_segment(index, 4:6);
+                found = true;
+                break;
+            end
+        end
+        
+        if ~found && ~isempty(std_segment)
+            % 如果没有找到匹配，使用第一个路径
+            tempth = [tempth, std_segment(1, 4:6)]; %#ok<AGROW>
+            if size(hamming, 2) >= k + 2
+                new_hamming_temp = [new_hamming_temp, hamming(1, k + 2)]; %#ok<AGROW>
+            end
+            temp = std_segment(1, 4:6);
+        end
+    end
+    
+    realpath = [realpath; tempth]; %#ok<AGROW>
+    new_hamming = [new_hamming; new_hamming_temp]; %#ok<AGROW>
+end
+
+% 最终路径排序
+realpath2 = [];
+new_hamming2 = [];
+
+for i = 1:8
+    temph = TransferTable(i, 10:12);
+    for k = 1:size(realpath, 1)
+        if k <= size(realpath, 1) && all(temph == realpath(k, 1:3))
+            realpath2 = [realpath2; realpath(k, :)]; %#ok<AGROW>
+            new_hamming2 = [new_hamming2; new_hamming(k, :)]; %#ok<AGROW>
+            break;
         end
     end
 end
 
-%% 7. 误码率计算
-bit_errors = sum(data_bits ~= demod_bits);
-BER = bit_errors / N_bits;
-
-fprintf('\n性能统计:\n');
-fprintf('误比特数: %d\n', bit_errors);
-fprintf('误码率: %.4f\n', BER);
-fprintf('正确率: %.2f%%\n', (1-BER)*100);
-
-%% 8. 波形显示
-if show_separate
-    % 模式1：每个图形单独窗口
-    
-    % 图形1: GMSK编码过程
-    figure('Position', [100, 100, 1400, 800], 'Name', 'GMSK编码波形');
-    
-    subplot(2,3,1);
-    stem(0:N_bits-1, data_bits, 'filled', 'MarkerSize', 4);
-    title('原始比特序列');
-    xlabel('比特索引');
-    ylabel('比特值');
-    grid on;
-    
-    subplot(2,3,2);
-    plot(t(1:min(20*sps, length(tx_signal)))*1000, tx_signal(1:min(20*sps, length(tx_signal))));
-    title('NRZ编码信号');
-    xlabel('时间 (ms)');
-    ylabel('幅度');
-    grid on;
-    
-    subplot(2,3,3);
-    plot(t_gauss*1000, gauss_filter, 'r-', 'LineWidth', 2);
-    title('高斯滤波器');
-    xlabel('时间 (ms)');
-    ylabel('幅度');
-    grid on;
-    
-    subplot(2,3,4);
-    plot(t(1:min(20*sps, length(filtered_signal)))*1000, filtered_signal(1:min(20*sps, length(filtered_signal))));
-    title('高斯滤波后信号');
-    xlabel('时间 (ms)');
-    ylabel('幅度');
-    grid on;
-    
-    subplot(2,3,5);
-    plot(t(1:min(20*sps, length(phase)))*1000, phase(1:min(20*sps, length(phase))));
-    title('相位轨迹');
-    xlabel('时间 (ms)');
-    ylabel('相位 (rad)');
-    grid on;
-    
-    subplot(2,3,6);
-    plot(t(1:min(10*sps, length(gmsk_signal)))*1000, gmsk_signal(1:min(10*sps, length(gmsk_signal))));
-    title('GMSK调制信号');
-    xlabel('时间 (ms)');
-    ylabel('幅度');
-    grid on;
-    
-    sgtitle('GMSK编码过程', 'FontSize', 14, 'FontWeight', 'bold');
-    
-    % 图形2: 解调过程分析
-    figure('Position', [100, 100, 1400, 800], 'Name', 'GMSK解调分析');
-    
-    subplot(2,3,1);
-    plot(t(1:min(10*sps, length(gmsk_signal_noisy)))*1000, gmsk_signal_noisy(1:min(10*sps, length(gmsk_signal_noisy))));
-    title('接收信号 (含噪声)');
-    xlabel('时间 (ms)');
-    ylabel('幅度');
-    grid on;
-    
-    subplot(2,3,2);
-    plot(t(1:min(20*sps, length(I_filtered)))*1000, I_filtered(1:min(20*sps, length(I_filtered))), 'b-');
-    hold on;
-    plot(t(1:min(20*sps, length(Q_filtered)))*1000, Q_filtered(1:min(20*sps, length(Q_filtered))), 'r-');
-    title('解调I/Q分量');
-    xlabel('时间 (ms)');
-    ylabel('幅度');
-    legend('I路', 'Q路');
-    grid on;
-    
-    subplot(2,3,3);
-    plot(t(1:min(20*sps, length(phase_est)))*1000, phase_est(1:min(20*sps, length(phase_est))));
-    title('估计相位');
-    xlabel('时间 (ms)');
-    ylabel('相位 (rad)');
-    grid on;
-    
-    subplot(2,3,4);
-    plot(t(1:min(20*sps, length(phase_unwrapped)))*1000, phase_unwrapped(1:min(20*sps, length(phase_unwrapped))));
-    title('展开相位');
-    xlabel('时间 (ms)');
-    ylabel('相位 (rad)');
-    grid on;
-    
-    subplot(2,3,5);
-    plot(t(1:length(instant_freq))*1000, instant_freq);
-    title('瞬时频率');
-    xlabel('时间 (ms)');
-    ylabel('频率 (Hz)');
-    grid on;
-    
-    subplot(2,3,6);
-    stem(0:N_bits-1, demod_bits, 'filled', 'MarkerSize', 4);
-    title('解调比特');
-    xlabel('比特索引');
-    ylabel('比特值');
-    grid on;
-    
-    sgtitle('GMSK解调过程', 'FontSize', 14, 'FontWeight', 'bold');
-    
-    % 图形3: 性能对比
-    figure('Position', [100, 100, 1200, 600], 'Name', '性能对比');
-    
-    subplot(2,3,1);
-    stem(0:N_bits-1, data_bits, 'b', 'filled', 'MarkerSize', 3);
-    hold on;
-    stem(0:N_bits-1, demod_bits, 'r', 'LineWidth', 1);
-    title('比特序列对比');
-    xlabel('比特索引');
-    ylabel('比特值');
-    legend('原始', '解调', 'Location', 'best');
-    grid on;
-    
-    subplot(2,3,2);
-    error_pattern = data_bits ~= demod_bits;
-    stem(0:N_bits-1, error_pattern, 'r', 'filled', 'MarkerSize', 3);
-    title('误码位置');
-    xlabel('比特索引');
-    ylabel('错误标记');
-    grid on;
-    
-    subplot(2,3,3);
-    scatter(I_filtered(1:sps:end), Q_filtered(1:sps:end), 30, 'b', 'filled');
-    title('星座图');
-    xlabel('I分量');
-    ylabel('Q分量');
-    axis equal;
-    grid on;
-    
-    subplot(2,3,4);
-    eyediagram(real(gmsk_signal_noisy(1:min(200*sps, length(gmsk_signal_noisy)))), 2*sps);
-    title('接收信号眼图');
-    
-    subplot(2,3,5);
-    % 相位轨迹对比
-    plot(t(1:min(10*sps, length(phase)))*1000, phase(1:min(10*sps, length(phase))), 'b-', 'LineWidth', 2);
-    hold on;
-    plot(t(1:min(10*sps, length(phase_unwrapped)))*1000, phase_unwrapped(1:min(10*sps, length(phase_unwrapped))), 'r--', 'LineWidth', 1);
-    title('相位轨迹对比');
-    xlabel('时间 (ms)');
-    ylabel('相位 (rad)');
-    legend('发射相位', '接收相位');
-    grid on;
-    
-    subplot(2,3,6);
-    % 性能统计
-    text(0.1, 0.8, sprintf('总比特数: %d', N_bits), 'FontSize', 12);
-    text(0.1, 0.65, sprintf('误比特数: %d', bit_errors), 'FontSize', 12);
-    text(0.1, 0.5, sprintf('误码率: %.4f', BER), 'FontSize', 12);
-    text(0.1, 0.35, sprintf('正确率: %.2f%%', (1-BER)*100), 'FontSize', 12);
-    text(0.1, 0.2, sprintf('信噪比: %d dB', SNR_dB), 'FontSize', 12);
-    axis off;
-    title('性能统计');
-    
-    sgtitle('GMSK系统性能分析', 'FontSize', 14, 'FontWeight', 'bold');
-    
+% 计算最终路径度量
+if isempty(hamming)
+    finalhamming = sum(hamming_head, 2);
 else
-    % 模式0：所有图形在一个窗口（简略版）
-    figure('Position', [50, 50, 1600, 900], 'Name', 'GMSK系统综合分析');
-    
-    % 编码过程
-    subplot(3,4,1);
-    stem(0:N_bits-1, data_bits, 'filled', 'MarkerSize', 3);
-    title('原始比特');
-    xlabel('比特索引');
-    grid on;
-    
-    subplot(3,4,2);
-    plot(t(1:min(10*sps, length(tx_signal)))*1000, tx_signal(1:min(10*sps, length(tx_signal))));
-    title('NRZ信号');
-    xlabel('时间 (ms)');
-    grid on;
-    
-    subplot(3,4,3);
-    plot(t(1:min(10*sps, length(phase)))*1000, phase(1:min(10*sps, length(phase))));
-    title('相位轨迹');
-    xlabel('时间 (ms)');
-    grid on;
-    
-    subplot(3,4,4);
-    plot(t(1:min(8*sps, length(gmsk_signal)))*1000, gmsk_signal(1:min(8*sps, length(gmsk_signal))));
-    title('GMSK信号');
-    xlabel('时间 (ms)');
-    grid on;
-    
-    % 解调过程
-    subplot(3,4,5);
-    plot(t(1:min(10*sps, length(gmsk_signal_noisy)))*1000, gmsk_signal_noisy(1:min(10*sps, length(gmsk_signal_noisy))));
-    title('接收信号');
-    xlabel('时间 (ms)');
-    grid on;
-    
-    subplot(3,4,6);
-    plot(t(1:min(15*sps, length(instant_freq)))*1000, instant_freq(1:min(15*sps, length(instant_freq))));
-    title('瞬时频率');
-    xlabel('时间 (ms)');
-    grid on;
-    
-    subplot(3,4,7);
-    stem(0:N_bits-1, demod_bits, 'filled', 'MarkerSize', 3);
-    title('解调比特');
-    xlabel('比特索引');
-    grid on;
-    
-    subplot(3,4,8);
-    error_pattern = data_bits ~= demod_bits;
-    stem(0:N_bits-1, error_pattern, 'r', 'filled', 'MarkerSize', 3);
-    title('误码位置');
-    xlabel('比特索引');
-    grid on;
-    
-    % 性能分析
-    subplot(3,4,9);
-    scatter(I_filtered(1:sps:end), Q_filtered(1:sps:end), 20, 'b', 'filled');
-    title('星座图');
-    xlabel('I分量');
-    ylabel('Q分量');
-    axis equal;
-    grid on;
-    
-    subplot(3,4,10);
-    eyediagram(real(gmsk_signal_noisy(1:min(200*sps, length(gmsk_signal_noisy)))), 2*sps);
-    title('眼图');
-    
-    subplot(3,4,11);
-    % 频谱
-    NFFT = 2^nextpow2(length(gmsk_signal));
-    f = Fs/2 * linspace(0,1,NFFT/2+1);
-    Y = fft(gmsk_signal, NFFT) / length(gmsk_signal);
-    plot(f/1000, 20*log10(2*abs(Y(1:NFFT/2+1))));
-    title('功率谱');
-    xlabel('频率 (kHz)');
-    ylabel('功率 (dB)');
-    grid on;
-    
-    subplot(3,4,12);
-    % 性能统计
-    text(0.1, 0.8, sprintf('BER: %.4f', BER), 'FontSize', 14, 'FontWeight', 'bold');
-    text(0.1, 0.6, sprintf('正确率: %.1f%%', (1-BER)*100), 'FontSize', 12);
-    text(0.1, 0.4, sprintf('误码数: %d', bit_errors), 'FontSize', 12);
-    text(0.1, 0.2, sprintf('SNR: %d dB', SNR_dB), 'FontSize', 12);
-    axis off;
-    title('性能统计');
-    
-    sgtitle('GMSK调制解调系统', 'FontSize', 16, 'FontWeight', 'bold');
+    finalhamming = [hamming(:,1), hamming_head, new_hamming2];
+    for i = 1:min(8, size(finalhamming, 1))
+        finalhamming(i,1) = sum(finalhamming(i,2:end));
+    end
 end
 
-%% 显示详细误码分析
-fprintf('\n误码分析:\n');
-error_indices = find(data_bits ~= demod_bits);
-if ~isempty(error_indices)
-    fprintf('误码位置: ');
-    fprintf('%d ', error_indices);
-    fprintf('\n');
+% 选择最佳路径
+if ~isempty(finalhamming)
+    [~, best_path_idx] = max(finalhamming(:,1));
+    decoded_path = [TransferTable(:,1:9), realpath2];
     
-    fprintf('误码对应的原始比特: ');
-    fprintf('%d ', data_bits(error_indices));
-    fprintf('\n');
+    % 提取解码比特
+    decoded_bits = [];
+    for i = 6:3:min(size(decoded_path, 2), 3*N_bits+3)
+        if i <= size(decoded_path, 2)
+            decoded_bits = [decoded_bits, decoded_path(best_path_idx, i)]; %#ok<AGROW>
+        end
+    end
     
-    fprintf('误码对应的解调比特: ');
-    fprintf('%d ', demod_bits(error_indices));
-    fprintf('\n');
+    fprintf('解码比特序列: ');
+    disp(decoded_bits);
+    fprintf('最佳路径号: %d\n', best_path_idx);
+    
+    % 计算误码率
+    compare_length = min(length(original_bits), length(decoded_bits));
+    bit_errors = sum(original_bits(1:compare_length) ~= decoded_bits(1:compare_length));
+    ber = bit_errors / compare_length;
+    
+    fprintf('误比特数: %d\n', bit_errors);
+    fprintf('误码率: %.4f\n', ber);
 else
-    fprintf('无误码！\n');
+    decoded_bits = [];
+    bit_errors = N_bits;
+    ber = 1;
+    fprintf('解码失败\n');
 end
 
-fprintf('\n仿真完成！\n');
-if BER > 0.1
-    fprintf('警告: 误码率较高，建议:\n');
-    fprintf('  1. 增加信噪比 (SNR_dB)\n');
-    fprintf('  2. 调整滤波器参数\n');
-    fprintf('  3. 检查载波频率匹配\n');
+%% 绘制解调结果
+figure('Position', [100, 100, 1200, 800]);
+
+% 原始比特序列
+subplot(3,2,1);
+stem(0:N_bits-1, original_bits, 'filled', 'LineWidth', 2);
+title('原始比特序列');
+xlabel('比特索引');
+ylabel('比特值');
+grid on;
+ylim([-1.5, 1.5]);
+
+% 解码比特序列
+subplot(3,2,2);
+if ~isempty(decoded_bits)
+    stem(0:length(decoded_bits)-1, decoded_bits, 'filled', 'r', 'LineWidth', 2);
+end
+title('解码比特序列');
+xlabel('比特索引');
+ylabel('比特值');
+grid on;
+ylim([-1.5, 1.5]);
+
+% 路径度量
+subplot(3,2,3);
+if ~isempty(finalhamming)
+    bar(finalhamming(:,1));
+end
+title('最终路径度量值');
+xlabel('路径索引');
+ylabel('度量值');
+grid on;
+
+% 星座图
+subplot(3,2,4);
+scatter(modulated_I, modulated_Q, 20, 'filled');
+title('接收信号星座图（含噪声）');
+xlabel('同相分量');
+ylabel('正交分量');
+grid on;
+axis equal;
+
+% 误码比较
+subplot(3,2,5);
+if ~isempty(decoded_bits)
+    compare_length = min(length(original_bits), length(decoded_bits));
+    error_pattern = original_bits(1:compare_length) ~= decoded_bits(1:compare_length);
+    stem(0:compare_length-1, error_pattern, 'filled', 'm', 'LineWidth', 2);
+end
+title('误码位置 (红色表示错误)');
+xlabel('比特索引');
+ylabel('错误标志');
+grid on;
+ylim([-0.5, 1.5]);
+
+% 系统性能总结
+subplot(3,2,6);
+text(0.1, 0.8, sprintf('总比特数: %d', N_bits), 'FontSize', 12);
+if ~isempty(decoded_bits)
+    text(0.1, 0.6, sprintf('正确解码: %d', N_bits - bit_errors), 'FontSize', 12);
+    %text(0.1, 0.4, sprintf('误比特数: %d', bit_errors), 'FontSize', 12);
+    %text(0.1, 0.2, sprintf('误码率: %.2f%%', ber * 100), 'FontSize', 12);
+else
+    text(0.1, 0.6, '解码失败', 'FontSize', 12, 'Color', 'red');
+end
+axis off;
+title('系统性能总结');
+
+sgtitle('GMSK解调结果', 'FontSize', 14, 'FontWeight', 'bold');
+
+%% 显示系统性能
+fprintf('\n=== 系统性能总结 ===\n');
+fprintf('总比特数: %d\n', N_bits);
+if ~isempty(decoded_bits)
+    fprintf('正确解码比特数: %d\n', N_bits - bit_errors);
+    fprintf('误码率: %.2f%%\n', ber * 100);
+else
+    fprintf('解码失败\n');
+end
+
+%% GMSK调制函数 - 用于解调（4点采样）
+function [Sn, Cn, phase] = gmsk_modulate(TransferPath, n, gt)
+    E = 1;
+    Tb = 1;
+    
+    % 采样时间点
+    t_points = [0.1*Tb, 0.3*Tb, 0.5*Tb, 0.8*Tb];
+    tn_1 = t_points - (n - 1)*Tb;
+    tn_2 = t_points - (n - 2)*Tb;
+    tn   = t_points - n*Tb;
+    
+    % 计算高斯脉冲响应
+    rtn_1 = arrayfun(@(x) integral(gt, -0.1, x) / (2*Tb), tn_1);
+    rtn_2 = arrayfun(@(x) integral(gt, -0.1, x) / (2*Tb), tn_2);
+    rtn   = arrayfun(@(x) integral(gt, -0.1, x) / (2*Tb), tn);
+    
+    % 计算相位
+    rtn_1 = rtn_1 .* pi .* TransferPath(2);
+    rtn_2 = rtn_2 .* pi .* TransferPath(5);
+    rtn   = rtn   .* pi .* TransferPath(3);
+    
+    phase = rtn + rtn_1 + rtn_2 + TransferPath(1);
+    
+    % 生成I/Q信号
+    Sn = sqrt(2*E/Tb) * cos(phase);
+    Cn = sqrt(2*E/Tb) * sin(phase);
+end
+
+%% GMSK调制函数 - 高分辨率用于显示连续波形
+function [Sn, Cn, phase, t, gmsk_signal, gmsk_transmit] = gmsk_modulate_high_res(TransferPath, n, gt, Tb, dt, E, fc)
+    % 高分辨率时间点
+    t = (n*Tb):dt:((n+1)*Tb - dt);
+    
+    % 计算高斯脉冲响应
+    rtn_1 = arrayfun(@(x) integral(gt, -0.1, x - (n - 1)*Tb) / (2*Tb), t);
+    rtn_2 = arrayfun(@(x) integral(gt, -0.1, x - (n - 2)*Tb) / (2*Tb), t);
+    rtn   = arrayfun(@(x) integral(gt, -0.1, x - n*Tb) / (2*Tb), t);
+    
+    % 计算相位
+    rtn_1 = rtn_1 .* pi .* TransferPath(2);
+    rtn_2 = rtn_2 .* pi .* TransferPath(5);
+    rtn   = rtn   .* pi .* TransferPath(3);
+    
+    phase = rtn + rtn_1 + rtn_2 + TransferPath(1);
+    
+    % 生成I/Q信号
+    Sn = sqrt(2*E/Tb) * cos(phase);
+    Cn = sqrt(2*E/Tb) * sin(phase);
+    
+    % 生成完整的GMSK基带信号 (复信号表示)
+    gmsk_signal = Sn + 1i * Cn;
+    
+    % 生成发送端GMSK信号 (调制到载波)
+    % GMSK信号: s(t) = cos(2πf_c t + φ(t))
+    gmsk_transmit = cos(2*pi*fc*t + phase);
+end
+
+%% 维特比解码函数
+function [path, hamming, hamming_head] = viterbi_decode(Sn, Cn, n, method, TransferTable, TransferPath, gt)
+    path = [];
+    temp_path = [];
+    temp_hamming = [];
+    hamming_head = zeros(8,3);
+    hamming = [];
+    
+    % 前3个码元的处理
+    if n <= 2
+        index = 1;
+        for i = 1:2^(n+1)
+            if index <= size(TransferTable, 1)
+                % 生成参考信号
+                path_segment = [TransferTable(index,(1 + n*3 + 3):(6 + n*3)), TransferTable(index,(1 + n*3):(1 + n*3 + 2))];
+                if length(path_segment) >= 6
+                    [Sn1, Cn1] = gmsk_modulate(path_segment, n, gt);
+                    
+                    % 相关检测
+                    result1 = dot(Sn1, Sn) + dot(Cn1, Cn);
+                    hamming_head(i,n+1) = result1;
+                end
+                index = index + max(1, 2^(2 - n));
+            end
+        end
+    else
+        % 后续码元的处理
+        switch method
+            case 'a'
+                indices = 1:8;
+            case 'b'
+                indices = 9:16;
+            otherwise
+                indices = 1:8;
+        end
+        
+        for idx = indices
+            if idx <= size(TransferPath, 1)
+                % 第一条路径
+                [Sn1, Cn1] = gmsk_modulate(TransferPath(idx,1:6), n, gt);
+                
+                % 第二条路径
+                path2 = [TransferPath(idx,1:3), TransferPath(idx,7:9)];
+                if length(path2) >= 6
+                    [Sn2, Cn2] = gmsk_modulate(path2, n, gt);
+                    
+                    % 相关检测
+                    result1 = dot(Sn1, Sn) + dot(Cn1, Cn);
+                    result2 = dot(Sn2, Sn) + dot(Cn2, Cn);
+                    
+                    % 选择最佳路径
+                    if result1 >= result2
+                        temp_path = [temp_path; TransferPath(idx, 4:6), TransferPath(idx,1:3)];
+                        temp_hamming = [temp_hamming; result1];
+                    else
+                        temp_path = [temp_path; TransferPath(idx, 7:9), TransferPath(idx,1:3)];
+                        temp_hamming = [temp_hamming; result2];
+                    end
+                end
+            end
+        end
+        
+        if ~isempty(temp_path)
+            path = temp_path;
+            hamming = temp_hamming;
+        end
+    end
 end
